@@ -73,6 +73,71 @@ port_in_use() {
 }
 
 # ============================================
+# SNI AUTO-SELECTION (best disguise domain)
+# ============================================
+# A REALITY "borrow" target must, when reached FROM THIS SERVER:
+#   - be reachable on :443
+#   - negotiate TLS 1.3
+#   - use the X25519 key-exchange group (hard REALITY requirement)
+#   - ideally support HTTP/2 (ALPN h2)
+# We test a pool of widely-used domains live and keep the ones that actually
+# work from this server's network, so we never hardcode a domain the censor
+# may have already tampered with.
+SNI_CANDIDATES=(
+    "www.microsoft.com"
+    "www.cloudflare.com"
+    "www.apple.com"
+    "dl.google.com"
+    "www.bing.com"
+    "aws.amazon.com"
+    "cdn.jsdelivr.net"
+    "www.samsung.com"
+    "www.icloud.com"
+    "swcdn.apple.com"
+    "www.tesla.com"
+    "www.lovelive-anime.jp"
+)
+
+# test_sni <domain> <strict>  -> returns 0 if usable for REALITY
+# strict=1 also requires ALPN h2; strict=0 only requires TLS1.3 + X25519
+test_sni() {
+    local domain="$1"
+    local strict="$2"
+    local out
+    out=$(timeout 6 openssl s_client -connect "${domain}:443" -servername "$domain" \
+        -tls1_3 -alpn h2 </dev/null 2>/dev/null)
+    [ -z "$out" ] && return 1
+    echo "$out" | grep -q "TLSv1.3"                  || return 1
+    echo "$out" | grep -qi "Server Temp Key: *X25519" || return 1
+    if [ "$strict" = "1" ]; then
+        echo "$out" | grep -q "ALPN protocol: h2"     || return 1
+    fi
+    return 0
+}
+
+# Echo up to 3 best SNIs (space separated). Strict pass first, then relaxed.
+pick_best_snis() {
+    local found=()
+    local d
+    for d in "${SNI_CANDIDATES[@]}"; do
+        if test_sni "$d" 1; then
+            found+=("$d")
+            [ "${#found[@]}" -ge 3 ] && break
+        fi
+    done
+    if [ "${#found[@]}" -lt 3 ]; then
+        for d in "${SNI_CANDIDATES[@]}"; do
+            [[ " ${found[*]} " == *" $d "* ]] && continue
+            if test_sni "$d" 0; then
+                found+=("$d")
+                [ "${#found[@]}" -ge 3 ] && break
+            fi
+        done
+    fi
+    echo "${found[@]}"
+}
+
+# ============================================
 # MAIN SCRIPT
 # ============================================
 
@@ -225,10 +290,18 @@ SHORTID=$(openssl rand -hex 8)
 SHORTID2=$(openssl rand -hex 8)
 SHORTID3=$(openssl rand -hex 8)
 
-# STEALTH: SNI targets to "borrow" handshake from. Must be real TLS 1.3 + H2 sites.
-SNI_TARGET="www.microsoft.com"
-SNI_TARGET2="dl.google.com"
-SNI_TARGET3="www.apple.com"
+# STEALTH: pick the best "borrow" domains live (see SNI_CANDIDATES above).
+# This avoids hardcoding microsoft/google/apple, which a censor may have
+# already poisoned for this route. We test reachability + TLS1.3 + X25519.
+echo -e "${CYAN}Auto-selecting best SNI domains (live test from this server)...${NC}"
+BEST_SNIS=$(pick_best_snis)
+read -r SNI_TARGET SNI_TARGET2 SNI_TARGET3 <<< "$BEST_SNIS"
+
+# Safe fallbacks if live testing found nothing (e.g. openssl missing / no net yet)
+[ -z "$SNI_TARGET" ]  && SNI_TARGET="www.microsoft.com"
+[ -z "$SNI_TARGET2" ] && SNI_TARGET2="$SNI_TARGET"
+[ -z "$SNI_TARGET3" ] && SNI_TARGET3="$SNI_TARGET"
+echo -e "${GREEN}[OK] Selected SNIs: ${SNI_TARGET}, ${SNI_TARGET2}, ${SNI_TARGET3}${NC}"
 
 echo -e "${GREEN}[OK] Keys generated!${NC}"
 
