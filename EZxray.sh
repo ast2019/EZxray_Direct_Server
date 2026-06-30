@@ -154,7 +154,7 @@ echo "     X   X  R   R  A   A    Y                                  "
 echo "                                                               "
 echo "             EZxray - STEALTH EDITION (REALITY)                "
 echo "      12 PROTOCOLS | Anti-DPI VLESS-REALITY-Vision             "
-echo "              Version 2.0.0 - STEALTH ULTRA                    "
+echo "        Version 2.1.0 - STEALTH ULTRA + BBR + SUB/QR           "
 echo "                                                               "
 echo "==============================================================="
 echo -e "${NC}"
@@ -168,7 +168,7 @@ fi
 
 echo -e "${CYAN}Installing required tools...${NC}"
 apt-get update -qq 2>/dev/null
-apt-get install -y xclip xsel net-tools iproute2 netcat-openbsd curl uuid-runtime openssl 2>/dev/null
+apt-get install -y xclip xsel net-tools iproute2 netcat-openbsd curl uuid-runtime openssl qrencode python3 2>/dev/null
 
 # Detect clipboard
 if command -v xclip &> /dev/null; then
@@ -187,6 +187,8 @@ echo -e "${GREEN}  + Borrows real TLS handshake (looks like normal HTTPS)"
 echo -e "${GREEN}  + Resistant to active probing"
 echo -e "${GREEN}  + 12 Protocols total (3 Reality + WS fallbacks)"
 echo -e "${GREEN}  + systemd Service (auto-restart, reboot-safe)"
+echo -e "${GREEN}  + BBR + TCP FastOpen (top connection performance)"
+echo -e "${GREEN}  + Subscription URL + QR codes (one-tap import)"
 echo -e ""
 
 # Public IP (best for share links)
@@ -558,6 +560,50 @@ for port in "${SELECTED_PORTS[@]}"; do
 done
 
 # ============================================
+# NETWORK PERFORMANCE TUNING (BBR + buffers + TFO)
+# ============================================
+# Applied system-wide so EVERY protocol/connection benefits, not just one.
+loading_animation "Optimizing network (BBR + TCP tuning)"
+modprobe tcp_bbr 2>/dev/null
+echo "tcp_bbr" > /etc/modules-load.d/bbr.conf 2>/dev/null
+
+cat > /etc/sysctl.d/99-xray-performance.conf <<'SYSCTL'
+# --- Congestion control: Google BBR + fair queue (lower latency, higher throughput) ---
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+# --- TCP Fast Open for both client and server (faster connection setup) ---
+net.ipv4.tcp_fastopen = 3
+# --- Larger socket buffers for high throughput / high-latency links ---
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.core.netdev_max_backlog = 250000
+net.core.somaxconn = 65535
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+# --- Connection handling / latency ---
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_max_tw_buckets = 2000000
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.ip_local_port_range = 1024 65535
+# --- File handles ---
+fs.file-max = 1000000
+SYSCTL
+
+sysctl --system >/dev/null 2>&1
+ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+if [ "$ACTIVE_CC" = "bbr" ]; then
+    echo -e "${GREEN}[OK] BBR active. Connection performance optimized.${NC}"
+else
+    echo -e "${YELLOW}[!] BBR not active yet (current: ${ACTIVE_CC}). A reboot may be needed to load tcp_bbr.${NC}"
+fi
+
+# ============================================
 # GENERATE SHARE LINKS
 # ============================================
 FANCY_NAME=$(generate_fancy_name)
@@ -594,6 +640,76 @@ BACKUP_FILE="${BACKUP_DIR}/xray_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
 tar -czf "$BACKUP_FILE" -C /usr/local/xray config.json 2>/dev/null
 
 # ============================================
+# SUBSCRIPTION + QR CODES
+# ============================================
+loading_animation "Building subscription link and QR codes"
+
+# All share links in one variable (REALITY first)
+ALL_CONFIGS="${REALITY_CONFIG}
+${REALITY_CONFIG2}
+${REALITY_CONFIG3}
+${VMESS_CONFIG}
+${TROJAN_CONFIG}
+${SS_CONFIG}
+${VMESS_CONFIG2}
+${TROJAN_CONFIG2}
+${SS_CONFIG2}
+${VMESS_CONFIG3}
+${TROJAN_CONFIG3}
+${SS_CONFIG3}"
+
+# Standard subscription format = base64 of newline-joined links
+SUB_DIR="/usr/local/xray/sub"
+mkdir -p "$SUB_DIR"
+SUB_TOKEN=$(openssl rand -hex 12)
+printf '%s\n' "$ALL_CONFIGS" | base64 -w 0 > "${SUB_DIR}/${SUB_TOKEN}.txt"
+cp "${SUB_DIR}/${SUB_TOKEN}.txt" /root/xray-subscription-base64.txt
+
+# Pick a leftover port (not used by a protocol) for the subscription HTTP service
+SUB_PORT=$(comm -23 <(printf '%s\n' "${ALL_PORTS[@]}" | sort -un) <(printf '%s\n' "${SELECTED_PORTS[@]}" | sort -un) | head -1)
+[ -z "$SUB_PORT" ] && SUB_PORT=10080
+
+# Serve the subscription over HTTP (token in the path acts as the secret)
+SUB_URL=""
+if command -v python3 &>/dev/null; then
+    cat > /etc/systemd/system/xray-sub.service <<SVC
+[Unit]
+Description=EZxray Subscription Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$(command -v python3) -m http.server ${SUB_PORT} --bind 0.0.0.0 --directory ${SUB_DIR}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SVC
+    systemctl daemon-reload
+    systemctl enable xray-sub >/dev/null 2>&1
+    systemctl restart xray-sub
+    ufw allow "${SUB_PORT}/tcp" 2>/dev/null
+    iptables -I INPUT -p tcp --dport "${SUB_PORT}" -j ACCEPT 2>/dev/null
+    SUB_URL="http://${SERVER_IP}:${SUB_PORT}/${SUB_TOKEN}.txt"
+fi
+
+# Generate QR code PNGs for every config (easy mobile import)
+QR_DIR="/root/xray-qr"
+mkdir -p "$QR_DIR"
+if command -v qrencode &>/dev/null; then
+    qr_i=1
+    for cfg in "$REALITY_CONFIG" "$REALITY_CONFIG2" "$REALITY_CONFIG3" \
+               "$VMESS_CONFIG" "$TROJAN_CONFIG" "$SS_CONFIG" \
+               "$VMESS_CONFIG2" "$TROJAN_CONFIG2" "$SS_CONFIG2" \
+               "$VMESS_CONFIG3" "$TROJAN_CONFIG3" "$SS_CONFIG3"; do
+        echo -n "$cfg" | qrencode -o "${QR_DIR}/config-${qr_i}.png" 2>/dev/null
+        qr_i=$((qr_i+1))
+    done
+    [ -n "$SUB_URL" ] && echo -n "$SUB_URL" | qrencode -o "${QR_DIR}/subscription.png" 2>/dev/null
+fi
+
+# ============================================
 # FINAL DISPLAY
 # ============================================
 clear
@@ -607,7 +723,9 @@ echo -e "${NC}"
 echo -e "${GREEN}IP:${NC} ${CYAN}${BOLD}${SERVER_IP}${NC}"
 echo -e "${GREEN}REALITY Public Key:${NC} ${WHITE}${REALITY_PUBLIC}${NC}"
 echo -e "${GREEN}AI Mode:${NC} ${OPTIMIZATION}"
+echo -e "${GREEN}Network:${NC} BBR + TCP FastOpen (optimized for speed)"
 echo -e "${GREEN}Ports:${NC} ${BOLD}${SELECTED_PORTS[*]}${NC}"
+[ -n "$SUB_URL" ] && echo -e "${GREEN}Subscription URL:${NC} ${CYAN}${BOLD}${SUB_URL}${NC}"
 
 echo -e "\n${YELLOW}${BOLD}=== STEALTH CONFIGS (RECOMMENDED - Anti-DPI) ===${NC}\n"
 echo -e "${GREEN}${BOLD}1) VLESS-REALITY (Port ${PORT_REALITY}, SNI ${SNI_TARGET})${NC}"
@@ -628,6 +746,14 @@ echo -e "${GREEN}10) VMESS 3 (Port ${PORT_VMESS3})${NC}\n${WHITE}${VMESS_CONFIG3
 echo -e "${GREEN}11) Trojan 3 (Port ${PORT_TROJAN3})${NC}\n${WHITE}${TROJAN_CONFIG3}${NC}\n"
 echo -e "${GREEN}12) Shadowsocks 3 (Port ${PORT_SS3})${NC}\n${WHITE}${SS_CONFIG3}${NC}\n"
 
+# Subscription QR (one scan imports ALL configs into the client)
+if [ -n "$SUB_URL" ] && command -v qrencode &>/dev/null; then
+    echo -e "${YELLOW}${BOLD}=== SUBSCRIPTION (scan to import ALL configs) ===${NC}"
+    echo -n "$SUB_URL" | qrencode -t ANSIUTF8 2>/dev/null
+    echo -e "${GREEN}Sub URL:${NC} ${CYAN}${SUB_URL}${NC}"
+    echo -e "${GREEN}Per-config QR PNGs saved in:${NC} ${QR_DIR}/\n"
+fi
+
 # ============================================
 # COPY MENU
 # ============================================
@@ -635,19 +761,6 @@ echo -e "${YELLOW}${BOLD}=== COPY MENU ===${NC}"
 echo -e "${GREEN}1) Copy ALL Configs   2) Copy Specific   3) Skip${NC}"
 echo -ne "${CYAN}Choose option (1-3): ${NC}"
 read -r choice
-
-ALL_CONFIGS="${REALITY_CONFIG}
-${REALITY_CONFIG2}
-${REALITY_CONFIG3}
-${VMESS_CONFIG}
-${TROJAN_CONFIG}
-${SS_CONFIG}
-${VMESS_CONFIG2}
-${TROJAN_CONFIG2}
-${SS_CONFIG2}
-${VMESS_CONFIG3}
-${TROJAN_CONFIG3}
-${SS_CONFIG3}"
 
 case $choice in
     1)
@@ -687,6 +800,8 @@ echo -e "${PURPLE}Restart:${NC} ${WHITE}systemctl restart xray${NC}"
 echo -e "${PURPLE}Status:${NC}  ${WHITE}systemctl status xray${NC}"
 echo -e "${PURPLE}Logs:${NC}    ${WHITE}journalctl -u xray -f${NC}"
 echo -e "${PURPLE}Ports:${NC}   ${WHITE}ss -tulpn | grep xray${NC}"
+echo -e "${PURPLE}Sub server:${NC} ${WHITE}systemctl status xray-sub${NC}"
+echo -e "${PURPLE}BBR check:${NC}  ${WHITE}sysctl net.ipv4.tcp_congestion_control${NC}"
 
 # ============================================
 # SAVE TO FILE
@@ -701,6 +816,9 @@ Generated: $(date '+%Y-%m-%d %H:%M:%S')
 AI Mode: ${OPTIMIZATION}
 REALITY Public Key: ${REALITY_PUBLIC}
 Selected Ports: ${SELECTED_PORTS[*]}
+Subscription URL: ${SUB_URL}
+QR codes (PNG): /root/xray-qr/
+Network: BBR + TCP FastOpen enabled
 
 === STEALTH CONFIGS (RECOMMENDED - Anti-DPI, no domain needed) ===
 
@@ -746,9 +864,12 @@ ${SS_CONFIG3}
 NOTES
 ===============================================================================
 - REALITY configs (1-3) are the most censorship-resistant. Prefer them.
-- The SNI targets (microsoft/google/apple) must be reachable from the server.
+- SNI targets are auto-selected live from this server (TLS1.3 + X25519).
+- Subscription URL imports ALL configs at once and the client auto-updates.
+- QR code PNGs for every config are in /root/xray-qr/.
+- BBR + TCP FastOpen are enabled system-wide for best connection performance.
 - To rotate identity, re-run this script (new keys/UUIDs each time).
-- Management: systemctl {start|stop|restart|status} xray
+- Management: systemctl {start|stop|restart|status} xray (and xray-sub)
 ===============================================================================
 EOF
 
