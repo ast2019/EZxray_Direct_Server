@@ -107,8 +107,8 @@ test_sni() {
     out=$(timeout 6 openssl s_client -connect "${domain}:443" -servername "$domain" \
         -tls1_3 -alpn h2 </dev/null 2>/dev/null)
     [ -z "$out" ] && return 1
-    echo "$out" | grep -q "TLSv1.3"                  || return 1
-    echo "$out" | grep -qi "Server Temp Key: *X25519" || return 1
+    echo "$out" | grep -q "TLSv1.3"   || return 1
+    echo "$out" | grep -qi "x25519"    || return 1
     if [ "$strict" = "1" ]; then
         echo "$out" | grep -q "ALPN protocol: h2"     || return 1
     fi
@@ -168,7 +168,7 @@ fi
 
 echo -e "${CYAN}Installing required tools...${NC}"
 apt-get update -qq 2>/dev/null
-apt-get install -y xclip xsel net-tools iproute2 netcat-openbsd curl uuid-runtime openssl qrencode python3 2>/dev/null
+apt-get install -y xclip xsel net-tools iproute2 netcat-openbsd curl uuid-runtime openssl qrencode python3 psmisc 2>/dev/null
 
 # Detect clipboard
 if command -v xclip &> /dev/null; then
@@ -556,7 +556,8 @@ fi
 loading_animation "Configuring Firewall"
 for port in "${SELECTED_PORTS[@]}"; do
     ufw allow "${port}/tcp" 2>/dev/null
-    iptables -I INPUT -p tcp --dport "${port}" -j ACCEPT 2>/dev/null
+    iptables -C INPUT -p tcp --dport "${port}" -j ACCEPT 2>/dev/null \
+        || iptables -I INPUT -p tcp --dport "${port}" -j ACCEPT 2>/dev/null
 done
 
 # ============================================
@@ -661,12 +662,18 @@ ${SS_CONFIG3}"
 # Standard subscription format = base64 of newline-joined links
 SUB_DIR="/usr/local/xray/sub"
 mkdir -p "$SUB_DIR"
+# SECURITY: serve a decoy index so hitting "/" does NOT list the directory and
+# leak the secret token filename. python's http.server serves index.html for "/".
+printf '%s' "<!doctype html><html><body><h1>It works!</h1></body></html>" > "${SUB_DIR}/index.html"
 SUB_TOKEN=$(openssl rand -hex 12)
 printf '%s\n' "$ALL_CONFIGS" | base64 -w 0 > "${SUB_DIR}/${SUB_TOKEN}.txt"
 cp "${SUB_DIR}/${SUB_TOKEN}.txt" /root/xray-subscription-base64.txt
 
-# Pick a leftover port (not used by a protocol) for the subscription HTTP service
-SUB_PORT=$(comm -23 <(printf '%s\n' "${ALL_PORTS[@]}" | sort -un) <(printf '%s\n' "${SELECTED_PORTS[@]}" | sort -un) | head -1)
+# Pick the first FREE leftover port (not used by a protocol) for the sub service
+SUB_PORT=""
+for p in $(comm -23 <(printf '%s\n' "${ALL_PORTS[@]}" | sort -un) <(printf '%s\n' "${SELECTED_PORTS[@]}" | sort -un)); do
+    if ! port_in_use "$p"; then SUB_PORT="$p"; break; fi
+done
 [ -z "$SUB_PORT" ] && SUB_PORT=10080
 
 # Serve the subscription over HTTP (token in the path acts as the secret)
@@ -690,7 +697,8 @@ SVC
     systemctl enable xray-sub >/dev/null 2>&1
     systemctl restart xray-sub
     ufw allow "${SUB_PORT}/tcp" 2>/dev/null
-    iptables -I INPUT -p tcp --dport "${SUB_PORT}" -j ACCEPT 2>/dev/null
+    iptables -C INPUT -p tcp --dport "${SUB_PORT}" -j ACCEPT 2>/dev/null \
+        || iptables -I INPUT -p tcp --dport "${SUB_PORT}" -j ACCEPT 2>/dev/null
     SUB_URL="http://${SERVER_IP}:${SUB_PORT}/${SUB_TOKEN}.txt"
 fi
 
